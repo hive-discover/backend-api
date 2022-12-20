@@ -19,4 +19,4 @@ ENV NODE_ENV production
 COPY . .
 ENTRYPOINT [ "node", "server.js" ]
 
-# registry.hive-discover.tech/api-v1:0.1.9.7
+# registry.hive-discover.tech/api-v1:0.1.16

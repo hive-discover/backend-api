@@ -1,4 +1,3 @@
-const similarity = require( 'compute-cosine-similarity' );
 const config = require('./config');
 const { performance } = require("perf_hooks");
 const userAuth = require('./user_auth');
@@ -18,142 +17,112 @@ function sampleRandomWeighted(weighted_ids, n = 0) {
     return weighted_ids;
 }
 
-// function calcSimilarPostScores(similar_posts, sample_doc_vectors) {
-//     return similar_posts.map(post => {
-//         const post_id = config.getCommentID(post);
-  
-//         // Calculate cosine-similarity
-//         // (average calculation can be ignored because it is everytime the same divisor: sample_batch_size)
-//         let total_sims = [];
-//         Object.keys(post?.doc_vector || {}).forEach(lang => {
-//           total_sims.push(
-//             Object.values(sample_doc_vectors).map(doc_item => {
-//               // Calculate sample-similar-cosine-similarity for this language
-//               if(!doc_item[lang] || !post.doc_vector[lang]) return 0;
-  
-//               // TODO: select if this similarity is good or bad
-//               return similarity(doc_item[lang], post.doc_vector[lang]) + 1;
-//             }).reduce((a, b) => a + b, 0)
-//           ); 
-//         });
-      
-//         return total_sims.map(sim => [post_id, sim]);
-//       }).flat()
-//         .filter(item => item[1] > 0)
-//         // Remove duplicated posts and keep the item with the highest score
-//         .reduce((acc, item) => {
-//           acc[item[0]] = (acc[item[0]] || 0) < item[1] ? item[1] : acc[item[0]];
-//           return acc;
-//         }, {});
-// }
-
 module.exports = (os_client, mongo_client) => {
 
     const documents = require('./documents')(os_client, mongo_client);
     const getUser = require('./users')(os_client, mongo_client);
 
-  let startTime;
+    const filterIDs = async (filter, ids) => {
+      // Build the query
+      const query = {_id : {$in : ids}};
+      if(filter){
+        if(filter?.parent_permlinks){
+          query["parent_permlink"] = {$in : filter.parent_permlinks};
+        }
+        if(filter?.tags){
+          query["json_metadata.tags"] = {$in : filter.authors};
+        }
+        if(filter?.langs){
+          filter.langs = filter.langs.map(lang => ({["known_tokens_ratio." + lang] : {$gt : 0.3}}));
+          query["$or"] = filter.langs;
+        }
+      }
+
+      // Get the filtered ids
+      const filtered_ids = await mongo_client.db("hive").collection("comments").find(query).project({_id : 1}).toArray();
+      return filtered_ids.map(v => v._id);
+    }
+
+    let startTime;
     const getFeed = async (username, prvActivityKey, amount, filter) => {
         startTime = performance.now();
         const user = await getUser(username, prvActivityKey);
         console.log(`getUser - ${performance.now() - startTime} ms`);
 
         // 0. Start tasks in background to have the result later prepared
-        const already_recommended_ids = user.getAlreadyRecommendedIDs(username);
+        const already_recommended_ids = user.getAlreadyRecommendedIDs();
 
         // 1. Get Scored Users Activitys
         startTime = performance.now();
-        const activity_scores = await user.getScoredAccountActivities(1000, 50, true);
+        const min_activity_count = Object.keys(filter).length > 0 ? 150 : 30;
+        const activity_scores = await user.getScoredAccountActivities(1000, min_activity_count, true);
         console.log(`getUserActivity - ${performance.now() - startTime} ms`);
 
         // 2. Get a random sample of activities (weighted by the interest-score) and keep the original score
         startTime = performance.now();
-        const sample_items = sampleRandomWeighted(Object.entries(activity_scores), 25).map(v => [v[0], activity_scores[v[0]]]);
+        const sample_items = sampleRandomWeighted(Object.entries(activity_scores), 35).map(v => [parseInt(v[0]), activity_scores[v[0]]]);
         const sample_ids = sample_items.map(v => v[0]);
         console.log(`getRandomSample of activities - ${performance.now() - startTime} ms`);
 
-        const filter_out_ids = [...(await already_recommended_ids), ...Object.keys(activity_scores)];
-
-        // 3. Find similar posts to the sample
+        // 3. Get all available vectors for the sample
         startTime = performance.now();
-        const similar_post_ids = await documents.findSimilarPosts(
-          sample_ids, 
-          4 + (filter?.distraction || 0),
-          username,
-          filter.tags,
-          filter.parent_permlinks,
-          filter_out_ids
-        );
-        console.log(`getSimilarPosts - ${performance.now() - startTime} ms`);
-        
-        // 4. Calculate the similarity score for each similar post to the sample and sum it up
+        const sample_vectors = await mongo_client.db("hive").collection("comments").find({ _id: { $in: sample_ids } }).project({ _id: 1, doc_vectors: 1, avg_image_vector : 1 }).toArray();
+        console.log(`getAllVectors for sample - ${performance.now() - startTime} ms`);
+
+        // 4. Find all similar items for the sample
         startTime = performance.now();
-        const similar_post_scores = Object.fromEntries(
-          await Promise.all(
-            similar_post_ids.map(async (id) => {
-              const result = await documents.calcSimilarScores(id, sample_ids); // [score to sample_ids[0], score to sample_ids[1], ...]
-              return [id, result.reduce((a, b) => a + b, 0)];
-            })
-          ) 
-        );// {post_id : total_sim_score, ...}
-        console.log(`calcSimilarPostScoresTotal - ${performance.now() - startTime} ms`);
-        
-        // 5. Get the final amount of posts (randomly weighted by the total-sim-score score)
+        const k = Object.keys(filter).length > 0 ? 50 : 12;
+        const similar_results = await Promise.all([
+          documents.findSimilarByVectors(sample_vectors.filter(v => v?.doc_vectors?.en).map(v => v.doc_vectors.en), k, "en"),
+          documents.findSimilarByVectors(sample_vectors.filter(v => v?.doc_vectors?.es).map(v => v.doc_vectors.es), k, "es"),
+          documents.findSimilarByVectors(sample_vectors.filter(v => v?.avg_image_vector).map(v => v.avg_image_vector), k, "avg_image_vector"),
+        ]).catch(e => console.error(e));
+        console.log(`findSimilarItems for sample - ${performance.now() - startTime} ms`);
+
+        if (!similar_results) return [];
+
+        // 5. Calculate the total sim score
+        // With 3 different similar-apis, we got a max-score of 6 (n * 2)
         startTime = performance.now();
-        const selected_ids = sampleRandomWeighted(Object.entries(similar_post_scores), amount).map(v => v[0]);
-        console.log(`getRandomSample of Similar - ${performance.now() - startTime} ms`);
-        
-        // 6. Get the final author / permlinks
+        const similar_items_scores = {}; // { id: total score }
+        for(const type_result of similar_results)
+        {
+          for(const item_results of type_result)
+          {
+            for(const [id, score] of Object.entries(item_results))
+            {
+              if(!similar_items_scores[id]) 
+                similar_items_scores[id] = 0;
+              similar_items_scores[id] += score / 6;
+            }
+          }
+        }
+        console.log(`calculateSimilarItemsScores - ${performance.now() - startTime} ms`);
+
+        // 6. Filter out all not-wanted items
         startTime = performance.now();
-        const selected_posts = await documents.getAuthorPermlinks(selected_ids);
-        console.log(`getSelectedPosts - ${performance.now() - startTime} ms`);
-        
+        const filter_out_ids = [...(await already_recommended_ids), ...Object.keys(activity_scores)].map(v => v.toString());
+        let filtered_items = Object.entries(similar_items_scores).filter(([id, score]) => !filter_out_ids.includes(id.toString()));
+        console.log(`filterOutNotWantedItems - ${performance.now() - startTime} ms`);
 
-        return selected_posts
-        // 3. Get the doc-vectors of the sample
-        // console.time("getSampleDocVectors")
-        // const sample_doc_vectors = await documents.getDocVectors(sample_ids.map(v => v[0]));
-        // console.timeEnd("getSampleDocVectors")
+        // 7. Filter IDs
+        startTime = performance.now();
+        const filtered_ids = await filterIDs(filter, filtered_items.map(v => parseInt(v[0])));
+        filtered_items = filtered_items.filter(([id, score]) => filtered_ids.includes(parseInt(id)));
+        console.log(`filterIDs - ${performance.now() - startTime} ms`);
 
-        // // 3.1 Filter not-wanted languages (if filter.langs is set)
-        // if (filter?.langs && filter.langs.length > 0) {
-        //     Object.keys(sample_doc_vectors).forEach(id => {
-        //         Object.keys(sample_doc_vectors[id]).forEach(lang => {
-        //             if (!filter.langs.includes(lang))
-        //                 delete sample_doc_vectors[id][lang];
-        //         });
-        //     });
-        // }
 
-        // // 4. Select the k most similar vectors
-        // console.time("getSimilarPosts")
-        // const filter_out_ids = [...(await already_recommended_ids), ...Object.keys(activity_scores)];
-        // const similar_posts = await documents.findSimilarToDocVectors(
-        //     sample_doc_vectors,
-        //     4 + (filter?.distraction || 0),
-        //     username,
-        //     filter.tags,
-        //     filter.parent_permlinks,
-        //     filter_out_ids // filter out already seen or recommended posts
-        // ).then(x => x.flat());
-        // console.timeEnd("getSimilarPosts")
+        // 8. Get the final posts by selecting randomly weighted by the score
+        startTime = performance.now();
+        const final_items = sampleRandomWeighted(filtered_items, amount);
+        console.log(`getRandomSample of finalItems - ${performance.now() - startTime} ms`);
 
-        // // 5. calculate the score of the similar posts with the total cosine similarity score with the sample-ones
-        // console.time("calcSimilarPostScores")
-        // const similar_posts_scores = calcSimilarPostScores(similar_posts, sample_doc_vectors);
-        // console.timeEnd("calcSimilarPostScores")
+        // 9. get the author permlinks
+        startTime = performance.now();
+        const final_items_posts = await mongo_client.db("hive").collection("comments").find({ _id: { $in: final_items.map(v => parseInt(v[0])) } }).project({ _id: 1, author: 1, permlink: 1 }).toArray();
+        console.log(`getAuthorPermlinks - ${performance.now() - startTime} ms`);
 
-        // // 6. select the right amount of posts randomly weighted by the score
-        // console.time("getRandomSelection")
-        // const selected_ids = sampleRandomWeighted(Object.entries(similar_posts_scores), amount).map(v => v[0]);
-        // console.timeEnd("getRandomSelection")
-
-        // // 7. get the authorperms of the selected posts
-        // console.time("getSelectedPosts")
-        // const selected_posts = await documents.getAuthorPermlinks(selected_ids);
-        // console.timeEnd("getSelectedPosts")
-
-        // return selected_posts;
+        return final_items_posts.map(v => ({ author: v.author, permlink: v.permlink }));
     }
 
     return {getFeed};

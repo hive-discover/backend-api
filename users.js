@@ -5,17 +5,17 @@ const workerpool = require('workerpool');
 
 const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 
-module.exports = (os_client, mongo_client) => {
+module.exports = (os_client, raw_mongo_client) => {
 
-  const documents = require('./documents')(os_client, mongo_client);
+  const documents = require('./documents')(os_client, raw_mongo_client);
 
 
   const decryptWorkerPool = workerpool.pool(__dirname + '/workers/decryptMetadata.js', {
     minWorkers : 'max'    
   });
   
-
-  mongo_client = mongo_client.db("activities");
+  mongo_client = raw_mongo_client.db("activities");
+  mongo_hivedb = raw_mongo_client.db("hive");
 
   return (username, prvActivityKey) => {
 
@@ -61,15 +61,26 @@ module.exports = (os_client, mongo_client) => {
       };
     }   
 
-    async function rankActivities(hits) {
+    async function rankScrollActivities(hits) {
+      if(hits.length === 0) return {};
+
       let activities = {}; // {post-id : timestamp-counting}
       let posts = new Set();
 
-      hits.forEach(({ _id, timestamp_count }) => {
-        const post_id = config.getCommentID(_id);
+      // get all post ids of the user
+      const authorperms = hits.map(({_id : meta}) => ({author : meta.author, permlink : meta.permlink}));
+      const post_ids = await mongo_hivedb.collection("comments").find({$or : authorperms}).project({_id : 1, author : 1, permlink : 1}).toArray();
+
+
+      // Enter all hits into activities
+      hits.forEach(({ _id : meta, timestamp_count }) => {
+        // Find the post id of the hit
+        const db_post = post_ids.find(({author, permlink}) => author === meta.author && permlink === meta.permlink);
+        if(!db_post) return;
         
-        posts.add(_id);
-        activities[post_id] = timestamp_count;
+        // Add the hit to the activities and post-list
+        posts.add({...meta, _id : db_post._id});
+        activities[db_post._id] = timestamp_count;
       });
 
       // Get average count of timestamps for these authorperms
@@ -83,7 +94,7 @@ module.exports = (os_client, mongo_client) => {
 
       const average_timestamp_counts = Object.fromEntries(
         posts.map((v, index) => [
-          config.getCommentID(posts[index]),
+          v._id,
           posts_avg_timestamps[index],
         ])
       );
@@ -101,19 +112,15 @@ module.exports = (os_client, mongo_client) => {
         Object.entries(activities)
           .map(([post_id, timestamps]) => {
             const user_event_counter = parseFloat(timestamps) || 0;
-            const avg = parseFloat(average_timestamp_counts[post_id]?.avg) || 0;
+            const post_avg = parseFloat(average_timestamp_counts[post_id]?.avg) || 0;
             let val = 0.0;
 
-            if (avg > 0 && user_event_counter > 0)
+            if (post_avg > 0 && user_event_counter > 0)
               // global average
-              val += clamp(user_event_counter / avg, 0.0, 2.0);
+              val += clamp(user_event_counter / post_avg, 0.0, 2.0);
             if (user_avg_timestamps > 0 && user_event_counter > 0)
               // user average
-              val +=
-                2 *
-                (user_event_counter < user_avg_timestamps
-                  ? user_event_counter / user_avg_timestamps
-                  : user_avg_timestamps / user_event_counter);
+              val += clamp(user_event_counter / user_avg_timestamps, 0.0, 2.0)
 
             if (val > 0) return [post_id, val];
             return null;
@@ -130,138 +137,170 @@ module.exports = (os_client, mongo_client) => {
     async function getScoredAccountActivities(
       limit = 1000,
       min = 1000,
-      allow_filling = true
+      allow_filling = true,
+      with_survey_answers = true
     ) {
 
-      // Get logged activities
-      const pipeline = [
-        {
-          $match: {
-            username: username,
+      const getScrollActivities = async () => {
+        // Get logged activities
+        const pipeline = [
+          {
+            $match: {
+              username: username,
+            },
           },
-        },
-        {
-          $group: {
-            _id : "$metadata_id",
-            timestamps : {
-              $push: "$created",
+          {
+            $group: {
+              _id : "$metadata_id",
+              timestamps : {
+                $push: "$created",
+              },
+              indexes : {
+                $push: "$index",
+              },
+              metadata : {
+                $first: "$metadata",
+              },
+              created : {
+                $first: "$created",
+              }
             },
-            indexes : {
-              $push: "$index",
+          },
+          {
+            $addFields: {
+              timestamp_count: { $size: "$timestamps" },
+              index_min: { $min: "$indexes" },
             },
-            metadata : {
-              $first: "$metadata",
+          },
+          {
+            $sort: {
+              index_min: 1,
             },
-            created : {
-              $first: "$created",
+          },
+          {
+            $limit: limit,
+          },
+          {
+            $project: {
+              _id: 1,
+              metadata: 1,
+              timestamp_count: 1,
+              index_min : 1,
+              created : 1
             }
-          },
-        },
-        {
-          $addFields: {
-            timestamp_count: { $size: "$timestamps" },
-            index_min: { $min: "$indexes" },
-          },
-        },
-        {
-          $sort: {
-            index_min: 1,
-          },
-        },
-        {
-          $limit: limit,
-        },
-        {
-          $project: {
-            _id: 1,
-            metadata: 1,
-            timestamp_count: 1,
-            index_min : 1,
-            created : 1
           }
-        }
-      ];
+        ];
 
-      // Iterate over the results and decode the data
-      console.time("user_has_scrolled")
-      const hits = await mongo_client.collection("user_has_scrolled").aggregate(pipeline).toArray();
-      console.timeEnd("user_has_scrolled")
-      console.time("decryptMetadata")
-      const activity_hits = await Promise.all(hits.map(doc => decryptWorkerPool.exec("decryptMetadata", [prvActivityKey, doc]))).then((result) => result.filter((item) => item));
-      console.timeEnd("decryptMetadata")
-      console.time("rankActivities")
-      const activity_scores = await rankActivities(activity_hits);
-      console.timeEnd("rankActivities")
+        // Iterate over the results and decode the data
+        console.time("user_has_scrolled")
+        const hits = await mongo_client.collection("user_has_scrolled").aggregate(pipeline).toArray();
+        console.timeEnd("user_has_scrolled")
+        console.time("decryptMetadata")
+        const activity_hits = await Promise.all(hits.map(doc => decryptWorkerPool.exec("decryptMetadata", [prvActivityKey, doc]))).then((result) => result.filter((item) => item));
+        console.timeEnd("decryptMetadata")
+        console.time("rankActivities")
+        const activity_scores = await rankScrollActivities(activity_hits);
+        console.timeEnd("rankActivities")
 
-  
+        return activity_scores;
+      };
+
+      const getRatingActivities = async () => {
+        // Get logged activities
+        const cursor = mongo_client.collection("user_has_survey_answered").find(({username})).sort({index : 1}).limit(limit);
+        const hits = await cursor.toArray();
+        if(!hits.length) return {};
+
+        // Iterate over the results and decode the data
+        let activity_hits = await Promise.all(hits.map(doc => decryptWorkerPool.exec("decryptMetadata", [prvActivityKey, doc]))).then((result) => result.filter((item) => item));
+        activity_hits = activity_hits.map(({_id : meta}) => ({author : meta.author, permlink : meta.permlink, rating : meta.survey_answer}))
+
+        // Get the post ids
+        const authorperms = activity_hits.map(({author, permlink}) => ({author, permlink}));
+        const post_ids = await mongo_hivedb.collection("comments").find({$or : authorperms}).project({_id : 1, author : 1, permlink : 1}).toArray();
+
+        // Score the activities with a value between 0 and 4
+        // max. survey answer is 5, so we divide by 5 and multiply by 4
+        const activity_scores = {};
+        activity_hits.forEach((hit) => {
+          const post_id = post_ids.find(({author, permlink}) => author === hit.author && permlink === hit.permlink)?._id;
+          if (!post_id) return;
+
+          const score = 4 * hit.rating / 5;
+          activity_scores[post_id] = score;
+        });
+
+        return activity_scores;
+      };
+
+      // Get all activities scored
+      // sorted by weight (lower index ==> more precise)
+      const activity_type_results = await Promise.all([
+        getScrollActivities(),
+        with_survey_answers ? getRatingActivities() : Promise.resolve({}),
+      ]);
+
+
+      // Merge the results and keep the score from the latest activity
+      const activity_scores = {};
+      activity_type_results.forEach((activity_type) => {
+        Object.entries(activity_type).forEach(([post_id, score]) => {
+          activity_scores[post_id] = score;
+        });
+      });
+
+      // Remove lowest scores, when over the limit
+      if (Object.keys(activity_scores).length > limit) {
+        const sorted_scores = Object.entries(activity_scores).sort((a, b) => b[1] - a[1]);
+        sorted_scores.slice(limit).forEach(([post_id]) => {
+          delete activity_scores[post_id];
+        });
+      }
+
       // Fill it with posts by the user (when under min)
+      console.time("fillActivities with user posts")
       if (Object.keys(activity_scores).length < min && allow_filling) {
         // Score of authored-post is 3
         const diff = min - Object.keys(activity_scores).length;
-        result = await os_client.search({
-          index: "hive-posts",
-          body: {
-            size: diff,
-            query: {
-              bool: {
-                must: [{ term: { author: { value: username } } }],
-              },
-            },
-            _source: {
-              includes: ["author", "permlink"],
-            },
-            sort: { timestamp: "DESC" }, // get latest posts first
-          },
-        });
-        result.body.hits.hits.forEach((hit) => {
-          activity_scores[config.getCommentID(hit._source)] = 3.0;
+        const user_posts = await mongo_hivedb.collection("comments").find({author : username}).project({_id : 1}).limit(diff).toArray();
+        user_posts.forEach(({_id}) => {
+          activity_scores[_id] = 3.0;
         });
       }
-
+      console.timeEnd("fillActivities with user posts")
+      
       // Fill it with votes (when under min)
+      console.time("fillActivities with user votes")
       if (Object.keys(activity_scores).length < min && allow_filling) {
         // Vote score is 1.2
         const diff = min - Object.keys(activity_scores).length;
-        result = await os_client.search({
-          index: "hive-posts",
-          body: {
-            size: diff,
-            query: {
-              bool: {
-                must: [{ term: { upvotes: { value: username } } }],
-              },
-            },
-            _source: {
-              includes: ["author", "permlink"],
-            },
-            sort: { timestamp: "DESC" }, // get latest posts first
-          },
-        });
-        result.body.hits.hits.forEach((hit) => {
-          activity_scores[config.getCommentID(hit._source)] = 1.2;
+        const user_votes_authorperms = await mongo_hivedb.collection("votes").find({voter : username, weight : {$gt : 100}}).sort({created : -1}).project({author : 1, permlink : 1}).limit(diff).toArray().then(x => x.map(({author, permlink}) => ({author, permlink})));
+        const voted_post_ids = await mongo_hivedb.collection("comments").find({$or : user_votes_authorperms}).project({_id : 1}).toArray();
+        voted_post_ids.forEach(({_id}) => {
+          activity_scores[_id] = 1.2;
         });
       }
+      console.timeEnd("fillActivities with user votes")
 
       return activity_scores;
     }
 
-    async function getAlreadyRecommendedIDs(days_minus = 7){
+    async function getAlreadyRecommendedIDs(days_minus = 7, limit = 3000){
         // Build and Execute query
         const startDate = new Date(Date.now() - days_minus * 24 * 60 * 60 * 1000);
-        const cursor = await mongo_client.collection("user_got_recommended").find({username : username}, {metadata : 1, created : 1}).sort({$natural : -1}).limit(1000);
+        const recommendations = await mongo_client.collection("user_got_recommended").find({username : username}, {metadata : 1, created : 1}).sort({index : 1}).limit(limit).toArray();
+        if(recommendations.length == 0) return [];
 
-        // Get all ids from the query by decrypting the metadata and created
-        const ids = [];
-        while (await cursor.hasNext()) {
-            // Get next document and compare with startDate
-            const doc = await cursor.next();
-            const {_id, created} = await decryptWorkerPool.exec("decryptMetadata", [prvActivityKey, doc]) || {};
-            if (created && created < startDate) break;
-            
-            const post_id = config.getCommentID(_id);
-            ids.push(post_id);
-        }
+        // Get all authorperms from the recommendations within the last days_minus days
+        const decrypted = await Promise.all(recommendations.map(doc => decryptWorkerPool.exec("decryptMetadata", [prvActivityKey, doc]))).then((result) => result.filter((item) => item));
+        const authorperms = decrypted
+            .filter(({created}) => created >= startDate)
+            .filter(({_id}) => _id?.author && _id?.permlink)
+            .map(({_id : metadata}) => ({author : metadata?.author, permlink : metadata?.permlink}));
+        if(authorperms.length == 0) return [];
 
+        // Get all post_ids from the recommendations
+        const ids = await mongo_hivedb.collection("comments").find({$or : authorperms}, {_id : 1}).toArray().then((docs) => docs.map((doc) => doc._id));
         return ids;
     }
 

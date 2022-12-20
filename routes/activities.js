@@ -39,7 +39,13 @@ const AVAILABLE_ACTIVITIES = {
         "post_collection" : "post_is_clicked_through",
         "required_metadata" : ["origin_type", "origin_author", "origin_permlink", "target_author", "target_permlink"],
         "delay" : 43200000 // half day in ms
-    }
+    },
+    "post_survey" : {
+        "user_collection" : "user_has_survey_answered",
+        "post_collection" : "post_got_survey_answered",
+        "required_metadata" : ["author", "permlink", "survey_answer"],
+        "delay" : 43200000 // half day in ms
+    },
 }
 
 module.exports = (os_client, mongo_client) => {
@@ -221,50 +227,22 @@ module.exports = (os_client, mongo_client) => {
         const user_avg_task = user.getUserAverageReadingTime(username);
 
         // Get activities and author&permlink
-        const scored_activities = await user.getScoredAccountActivities(250, amount, false);
-        const author_permlinks = await documents.getAuthorPermlinks(Object.keys(scored_activities))
+        const scored_activities = await user.getScoredAccountActivities(250, amount, false, false);
+        const author_permlinks = await mongo_client.db("hive").collection("comments")
+            .find({_id : {$in : Object.keys(scored_activities).map((id) => parseInt(id))}})
+            .project({author : 1, permlink : 1, _id : 1})
+            .toArray();
 
         // Combine scores with author_permlinks
-        const post_scores = author_permlinks.map((post) => {
+        const post_scores = author_permlinks.map(({author, permlink, _id}) => {
             return {
-                author : post.author,
-                permlink : post.permlink,
-                score : scored_activities[config.getCommentID(post)] / 4 // 4 is the max score ==> percentage
+                author, permlink,
+                score : scored_activities[_id] / 4 // 4 is the max score ==> percentage
             }
         }).sort((a, b) => b.score - a.score).slice(0, amount);
 
         res.send({status : "ok", result : {post_scores, user_avg : await user_avg_task}}).end()
     })
-
-    // router.delete('/delete', async (req, res) => {
-    //     // Required Fields
-    //     const username = req.query.username;
-    //     const access_token = req.query.access_token;
-    //     const keychain_signed_msg = req.query.keychain_signed_msg;
-
-    //     // Check auth
-    //     const [authed, method, info] = await authorizeUser({username, access_token, keychain_signed_msg})
-    //     if(!authed)
-    //         return res.send({status: "failed", error : "Not authorized", info : info, method : method}).end();
-
-    //     // Delete Data
-    //     const os_client = config.getOsClient();
-    //     const result = await os_client.deleteByQuery({
-    //         index : "user-activities",
-    //         body : {
-    //             query : {
-    //                 bool : {
-    //                     must : [
-    //                         {term : {"username.keyword" : {value : username}}}
-    //                     ]
-    //                 }
-    //             }
-    //         }
-    //     });
-
-    //     const removed_docs = result.body.deleted;
-    //     res.send({status : "ok", result : removed_docs}).end()
-    // });
 
     return router;
 }

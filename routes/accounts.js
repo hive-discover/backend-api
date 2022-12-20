@@ -19,88 +19,6 @@ module.exports = (os_client, mongo_client) => {
   router.use(bodyParser.urlencoded({ extended: true }));
   router.use(queryParser())
 
-  const {getFeed, getScoredAccountActivities} = require('../calc_feed')(os_client, mongo_client);
-
-
-  const getAccountProfile = async (username) => {
-      const search_query = {
-          "size" : 1000,
-          "query" : {
-            "bool" : {
-              "should": [
-                {
-                  "term" : {
-                    "author" : username
-                  }
-                },
-                {
-                  "term" : {
-                    "upvotes" : username
-                  }
-                }
-              ]
-            }
-          },
-          "_source" : {
-              "includes" : [ "author", "categories", "language"]
-          }
-      }
-
-      let categories = Array(46).fill(0);
-      let languages = {};
-      let cat_counter = 0;
-
-      let batch = await os_client.search({index : "hive-posts", body : search_query, scroll : "10m"});
-      while(true){
-          // Get a batch
-          if(!batch.body.hits.hits || batch.body.hits.hits.length === 0)
-              break;
-
-          // Add the batch and process it
-          batch.body.hits.hits.forEach(post => {
-              // Own Posts counts twice
-              let multiplier = 1;
-              if(post._source.author === username)
-                  multiplier = 2;
-
-              // Add the categories
-              if(post["_source"]["category"] && Array.isArray(post["_source"]["category"]) && post["_source"]["category"].length === 46){            
-                  categories += post["_source"]["category"] * multiplier;
-                  cat_counter += 1 * multiplier;
-              }
-
-              // Add the languages
-              if(post["_source"]["language"]){
-                  post["_source"]["language"].forEach(({x, lang}) => {
-                      if(!languages[lang])
-                          languages[lang] = 0;
-
-                      languages[lang] += x * multiplier;
-                  })
-              }
-          });
-
-          // Get the next batch
-          const scroll_id = batch.body['_scroll_id']
-          batch = await os_client.scroll({scroll_id : scroll_id, scroll : "10m"})
-      }
-
-      // Calculate the average for the categories
-      if(cat_counter > 0)
-          categories = categories.map(x => x / cat_counter);
-
-      // Calculate the percentage for the languages and filter out langs with below 25%
-      const total_score = Object.values(languages).reduce((a, b) => a + b, 0);
-      if(total_score > 0) {
-          Object.keys(languages).forEach(lang => {
-              languages[lang] = languages[lang] / total_score;
-          });
-      }
-      const filtered_langs = Object.keys(languages).filter(lang => languages[lang] > 0.25);
-
-      return {categories : categories, langs : filtered_langs};
-  }
-
   router.get('/', async (req, res) => {
       // Required
       const username = req.query.username;
@@ -112,7 +30,7 @@ module.exports = (os_client, mongo_client) => {
       // We do not need to check if the user exists, because we will just get an empty profile if he does not exist
 
       // Account does exist
-      res.send({status : "ok", msg : "Account is available", profile : (await getAccountProfile(username))}).end()
+      res.send({status : "ok", msg : "Account is available", profile : {}}).end()
   })
     
   router.get('/session-id', async (req, res) => {

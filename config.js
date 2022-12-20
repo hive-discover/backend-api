@@ -85,3 +85,10 @@ module.exports.getCommentID = ({author, permlink}) => {
     const buffer = Buffer.from(`${author}/${permlink}`);
     return XXHash.hash64(buffer, 0xCAFEBABE).toString("base64");
 }
+
+// Vector-field Sim APIS
+module.exports.VECTORFIELD_SIM_APIS = {
+    "en" : process.env.VECTOR_SIM_API_EN || "http://hive-comments-last-7d-en.hive-discover.tech",
+    "es" : process.env.VECTOR_SIM_API_ES || "http://hive-comments-last-7d-es.hive-discover.tech",
+    "avg_image_vector" : process.env.VECTOR_SIM_API_AVG_IMG || "http://hive-comments-last-7d-avg-images.hive-discover.tech"
+  }
